@@ -1,0 +1,5 @@
+PySide6-Essentials>=6.8
+mss>=9.0
+numpy>=1.26
+opencv-python-headless>=4.10
+img2pdf>=0.5

@@ -1,0 +1,20 @@
+[project]
+name = "slide-screenshotter"
+version = "0.1.0"
+description = "Cattura automatica delle slide durante lezioni online basata sul cambiamento visivo dello schermo."
+requires-python = ">=3.11"
+# Tenere allineato con requirements.txt.
+dependencies = [
+    "PySide6-Essentials>=6.8",
+    "mss>=9.0",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.10",
+    "img2pdf>=0.5",
+]
+
+[project.scripts]
+slide-screenshotter = "slide_screenshotter.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

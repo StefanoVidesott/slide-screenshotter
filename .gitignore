@@ -1,0 +1,28 @@
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Slide catturate e PDF generati
+temp_slides/
+*.pdf
+
+# uv (non usato: dipendenze in requirements.txt)
+uv.lock
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
