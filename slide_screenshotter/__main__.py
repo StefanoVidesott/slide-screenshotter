@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from .settings import AppSettings
 from .storage import SlideStorage, StorageError
 from .ui.main_window import ControlPanel
 from .ui.win32 import set_app_user_model_id
@@ -39,6 +40,7 @@ def main() -> int:
     set_app_user_model_id("SlideScreenshotter")
 
     app = QApplication(sys.argv)
+    app.setOrganizationName("SlideScreenshotter")
     app.setApplicationName("Slide Screenshotter")
     app.setWindowIcon(QIcon(str(ICON_PATH)))
     # Chiudere la galleria o il selettore ROI non deve terminare l'app:
@@ -52,7 +54,7 @@ def main() -> int:
         QMessageBox.critical(None, "Errore", str(exc))
         return 1
 
-    window = ControlPanel(storage)
+    window = ControlPanel(storage, AppSettings())
     window.show()
     return app.exec()
 

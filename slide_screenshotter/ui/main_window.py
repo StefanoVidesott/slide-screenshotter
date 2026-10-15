@@ -7,11 +7,13 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QApplication,
     QMainWindow,
@@ -22,25 +24,33 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..monitor import CaptureWorker, Roi
+from ..monitor import CaptureWorker, Roi, roi_on_screen
+from ..settings import AppSettings
 from ..storage import SlideStorage, StorageError
 from .gallery import GalleryDialog
+from .hotkeys import SUPPORTED as HOTKEYS_SUPPORTED
+from .hotkeys import GlobalHotkeys
 from .overlay import StatusOverlay
 from .roi_selector import RoiSelector
 
 # Lo slider lavora in decimi di punto percentuale: 1 → 0.1%, 500 → 50%.
 _SLIDER_SCALE = 10
-_DEFAULT_THRESHOLD = 5.0
+
+# Scorciatoie globali (attive anche mentre la finestra della lezione ha il focus).
+HOTKEY_CAPTURE = "Ctrl+Alt+S"
+HOTKEY_TOGGLE = "Ctrl+Alt+P"
 
 
 class ControlPanel(QMainWindow):
     """Collega GUI, thread di cattura e archivio su disco."""
 
-    def __init__(self, storage: SlideStorage) -> None:
+    def __init__(self, storage: SlideStorage, settings: AppSettings) -> None:
         super().__init__()
         self.setWindowTitle("Slide Screenshotter")
         self._storage = storage
+        self._settings = settings
         self._selector: RoiSelector | None = None
+        self._gallery_open = False
 
         self._overlay = StatusOverlay()
         self._worker = CaptureWorker(storage, self)
@@ -54,6 +64,9 @@ class ControlPanel(QMainWindow):
         self._build_ui()
         self._refresh_count()
         self._on_monitoring_changed(False)
+        self._restore_last_roi()
+        self._setup_hotkeys()
+        settings.restore_geometry("main", self)
 
         self._worker.start()
         self._overlay.show()
@@ -66,13 +79,27 @@ class ControlPanel(QMainWindow):
         self._roi_label = QLabel("Nessuna area selezionata")
         self._roi_label.setStyleSheet("color: palette(placeholder-text);")
 
+        self._profile_combo = QComboBox()
+        self._profile_combo.setPlaceholderText("Nessun profilo")
+        self._profile_combo.setToolTip("Aree salvate (es. una per Teams, una per Zoom)")
+        self._profile_combo.activated.connect(self._on_profile_activated)
+        self._save_profile_button = QPushButton("Salva…")
+        self._save_profile_button.setToolTip("Salva l'area attuale come profilo")
+        self._save_profile_button.clicked.connect(self._save_profile)
+        self._delete_profile_button = QPushButton("Elimina")
+        self._delete_profile_button.setToolTip("Elimina il profilo selezionato")
+        self._delete_profile_button.clicked.connect(self._delete_profile)
+        self._refresh_profiles()
+
         self._start_button = QPushButton("▶  Start")
         self._start_button.clicked.connect(self._start)
         self._pause_button = QPushButton("⏸  Pausa")
         self._pause_button.clicked.connect(self._worker.pause_monitoring)
 
         self._manual_button = QPushButton("Scatto manuale")
-        self._manual_button.setToolTip("Salva subito la ROI e avvia il cooldown (Ctrl+Shift+S)")
+        self._manual_button.setToolTip(
+            f"Salva subito la ROI e avvia il cooldown (Ctrl+Shift+S, ovunque: {HOTKEY_CAPTURE})"
+        )
         self._manual_button.clicked.connect(self._manual_capture)
         self._undo_button = QPushButton("Annulla scatto")
         self._undo_button.setToolTip("Elimina l'ultima slide salvata (Ctrl+Z)")
@@ -87,7 +114,7 @@ class ControlPanel(QMainWindow):
         # Soglia
         self._threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self._threshold_slider.setRange(1, 50 * _SLIDER_SCALE)
-        self._threshold_slider.setValue(int(_DEFAULT_THRESHOLD * _SLIDER_SCALE))
+        self._threshold_slider.setValue(round(self._settings.threshold * _SLIDER_SCALE))
         self._threshold_slider.valueChanged.connect(self._on_threshold_changed)
         self._threshold_label = QLabel()
         self._threshold_label.setMinimumWidth(48)
@@ -107,15 +134,17 @@ class ControlPanel(QMainWindow):
         self._interval_spin.setRange(0.1, 10.0)
         self._interval_spin.setSingleStep(0.1)
         self._interval_spin.setSuffix(" s")
-        self._interval_spin.setValue(0.5)
+        self._interval_spin.setValue(self._settings.interval)
         self._interval_spin.valueChanged.connect(self._worker.set_interval)
+        self._interval_spin.valueChanged.connect(lambda v: setattr(self._settings, "interval", v))
 
         self._cooldown_spin = QDoubleSpinBox()
         self._cooldown_spin.setRange(0.0, 60.0)
         self._cooldown_spin.setSingleStep(0.5)
         self._cooldown_spin.setSuffix(" s")
-        self._cooldown_spin.setValue(3.0)
+        self._cooldown_spin.setValue(self._settings.cooldown)
         self._cooldown_spin.valueChanged.connect(self._worker.set_cooldown)
+        self._cooldown_spin.valueChanged.connect(lambda v: setattr(self._settings, "cooldown", v))
 
         settings = QGroupBox("Impostazioni")
         form = QFormLayout(settings)
@@ -134,6 +163,16 @@ class ControlPanel(QMainWindow):
         roi_row.addWidget(self._roi_button)
         roi_row.addWidget(self._roi_label, 1)
 
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profilo:"))
+        profile_row.addWidget(self._profile_combo, 1)
+        profile_row.addWidget(self._save_profile_button)
+        profile_row.addWidget(self._delete_profile_button)
+
+        self._hotkey_label = QLabel()
+        self._hotkey_label.setWordWrap(True)
+        self._hotkey_label.setStyleSheet("color: palette(placeholder-text);")
+
         self._count_label = QLabel()
         self._count_label.setStyleSheet("font-size: 15px; font-weight: 600;")
         self._state_label = QLabel()
@@ -145,7 +184,9 @@ class ControlPanel(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addLayout(roi_row)
+        layout.addLayout(profile_row)
         layout.addLayout(controls)
+        layout.addWidget(self._hotkey_label)
         layout.addWidget(settings)
         layout.addLayout(status_row)
         layout.addWidget(self._export_button)
@@ -176,10 +217,133 @@ class ControlPanel(QMainWindow):
         QTimer.singleShot(250, self._selector.start)
 
     def _on_roi_selected(self, roi: Roi) -> None:
-        self._worker.set_roi(roi)
-        self._roi_label.setText(f"Area: {roi}")
-        self._roi_label.setStyleSheet("")
+        self._apply_roi(roi)
         self._on_roi_finished()
+
+    def _apply_roi(self, roi: Roi, note: str = "") -> None:
+        self._worker.set_roi(roi)
+        self._settings.roi = roi
+        self._roi_label.setText(f"Area: {roi}{note}")
+        self._roi_label.setStyleSheet("")
+        self._select_matching_profile(roi)
+
+    def _restore_last_roi(self) -> None:
+        roi = self._settings.roi
+        if roi is None:
+            return
+        if roi_on_screen(roi):
+            self._apply_roi(roi, "  (ultima usata)")
+        else:
+            # Monitor scollegato o risoluzione cambiata: l'area non esiste più.
+            self._settings.roi = None
+
+    # ----- Profili area -----
+
+    def _refresh_profiles(self, select: str | None = None) -> None:
+        self._profile_combo.clear()
+        self._profile_combo.addItems(list(self._settings.roi_profiles()))
+        self._profile_combo.setCurrentIndex(self._profile_combo.findText(select) if select else -1)
+        self._update_profile_buttons()
+
+    def _update_profile_buttons(self) -> None:
+        self._profile_combo.setEnabled(self._profile_combo.count() > 0)
+        self._delete_profile_button.setEnabled(self._profile_combo.currentIndex() >= 0)
+
+    def _select_matching_profile(self, roi: Roi) -> None:
+        names = [name for name, saved in self._settings.roi_profiles().items() if saved == roi]
+        self._profile_combo.setCurrentIndex(self._profile_combo.findText(names[0]) if names else -1)
+        self._update_profile_buttons()
+
+    def _on_profile_activated(self, index: int) -> None:
+        name = self._profile_combo.itemText(index)
+        roi = self._settings.roi_profiles().get(name)
+        if roi is None:
+            return
+        if not roi_on_screen(roi):
+            QMessageBox.warning(
+                self,
+                "Area non disponibile",
+                f"L'area del profilo «{name}» ({roi}) è fuori dagli schermi collegati.\n"
+                "Seleziona di nuovo l'area e salva il profilo.",
+            )
+            current = self._worker.roi()
+            if current is not None:
+                self._select_matching_profile(current)
+            else:
+                self._refresh_profiles()
+            return
+        self._apply_roi(roi, f"  (profilo «{name}»)")
+
+    def _save_profile(self) -> None:
+        roi = self._worker.roi()
+        if roi is None:
+            QMessageBox.information(self, "Nessuna area", "Seleziona prima un'area da salvare come profilo.")
+            return
+        current = self._profile_combo.currentText() if self._profile_combo.currentIndex() >= 0 else ""
+        name, ok = QInputDialog.getText(self, "Salva profilo", f"Nome del profilo per l'area {roi}:", text=current)
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in self._settings.roi_profiles() and name != current:
+            answer = QMessageBox.question(
+                self,
+                "Profilo esistente",
+                f"Il profilo «{name}» esiste già. Sovrascriverlo?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._settings.save_roi_profile(name, roi)
+        self._refresh_profiles(select=name)
+        self.statusBar().showMessage(f"Profilo «{name}» salvato", 3000)
+
+    def _delete_profile(self) -> None:
+        if self._profile_combo.currentIndex() < 0:
+            return
+        name = self._profile_combo.currentText()
+        answer = QMessageBox.question(
+            self,
+            "Elimina profilo",
+            f"Eliminare il profilo «{name}»? L'area attuale resta selezionata.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._settings.delete_roi_profile(name)
+            self._refresh_profiles()
+
+    # ----- Scorciatoie globali -----
+
+    def _setup_hotkeys(self) -> None:
+        self._hotkeys = GlobalHotkeys(self)
+        self._hotkeys.activated.connect(self._on_hotkey)
+        if not HOTKEYS_SUPPORTED:
+            self._hotkey_label.setText("Scorciatoie globali disponibili solo su Windows.")
+            return
+        parts = []
+        for name, keys, action in (
+            ("capture", HOTKEY_CAPTURE, "scatto"),
+            ("toggle", HOTKEY_TOGGLE, "avvia/pausa"),
+        ):
+            registered = self._hotkeys.register(name, keys)
+            parts.append(f"{keys} {action}" + ("" if registered else " (già in uso da un'altra app)"))
+        self._hotkey_label.setText("Scorciatoie globali: " + " · ".join(parts))
+
+    def _on_hotkey(self, name: str) -> None:
+        if self._selector is not None or self._gallery_open:
+            return  # durante la selezione dell'area o l'esportazione non si cattura
+        if self._worker.roi() is None:
+            # Niente finestre di dialogo: l'utente sta guardando la lezione.
+            self.statusBar().showMessage("Scorciatoia ignorata: seleziona prima un'area (ROI).", 5000)
+            return
+        if name == "capture":
+            self._worker.request_manual_capture()
+        elif name == "toggle":
+            if self._worker.is_monitoring():
+                self._worker.pause_monitoring()
+            else:
+                self._worker.start_monitoring()
 
     def _on_roi_finished(self) -> None:
         self._selector = None
@@ -226,8 +390,12 @@ class ControlPanel(QMainWindow):
                 "Non ci sono slide da esportare.\nAvvia il monitoraggio o usa lo scatto manuale.",
             )
             return
-        dialog = GalleryDialog(self._storage, self)
-        dialog.exec()
+        dialog = GalleryDialog(self._storage, self._settings, self)
+        self._gallery_open = True
+        try:
+            dialog.exec()
+        finally:
+            self._gallery_open = False
         self._refresh_count()
 
     # ----- Slot dai segnali del worker -----
@@ -256,6 +424,7 @@ class ControlPanel(QMainWindow):
         percent = value / _SLIDER_SCALE
         self._threshold_label.setText(f"{percent:.1f}%")
         self._worker.set_threshold(percent)
+        self._settings.threshold = percent
 
     # ----- Utility -----
 
@@ -284,6 +453,8 @@ class ControlPanel(QMainWindow):
         self._state_label.setText(f"<span style='color:{color}'>●</span> {text}")
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._settings.save_geometry("main", self)
+        self._hotkeys.unregister_all()
         self._worker.stop()
         self._worker.wait(3000)
         self._overlay.close()

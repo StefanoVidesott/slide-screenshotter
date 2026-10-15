@@ -30,6 +30,25 @@ class Roi:
         return f"{self.width}×{self.height} @ ({self.left}, {self.top})"
 
 
+def roi_on_screen(roi: Roi) -> bool:
+    """True se la ROI è interamente dentro il desktop virtuale attuale.
+
+    Serve per le aree salvate: dopo aver scollegato un monitor o cambiato
+    risoluzione, un'area vecchia farebbe fallire ogni cattura.
+    """
+    try:
+        with mss.mss() as sct:
+            desktop = sct.monitors[0]  # rettangolo che contiene tutti gli schermi
+    except Exception:  # noqa: BLE001 - se non si può verificare, non si scarta l'area
+        return True
+    return (
+        roi.left >= desktop["left"]
+        and roi.top >= desktop["top"]
+        and roi.left + roi.width <= desktop["left"] + desktop["width"]
+        and roi.top + roi.height <= desktop["top"] + desktop["height"]
+    )
+
+
 class CaptureWorker(QThread):
     """Loop di cattura e confronto, eseguito fuori dal thread della GUI.
 

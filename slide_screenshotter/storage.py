@@ -6,11 +6,13 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 
 import cv2
 import numpy as np
 
-_SLIDE_PATTERN = re.compile(r"^slide_(\d{4,})_\d{8}-\d{6}\.png$")
+_SLIDE_PATTERN = re.compile(r"^slide_(\d{4,})_(\d{8}-\d{6})\.png$")
+_REORDER_SUFFIX = ".reorder"
 
 
 class StorageError(Exception):
@@ -73,6 +75,61 @@ class SlideStorage:
                 raise StorageError(f"Impossibile eliminare {last.name}: {exc}") from exc
             return last
 
+    def delete(self, paths: Sequence[Path]) -> int:
+        """Elimina le slide indicate. Restituisce il numero di file eliminati."""
+        with self._lock:
+            removed = 0
+            for path in paths:
+                try:
+                    Path(path).unlink()
+                    removed += 1
+                except FileNotFoundError:
+                    pass  # già eliminata: il risultato è comunque quello voluto
+                except OSError as exc:
+                    raise StorageError(f"Impossibile eliminare {Path(path).name}: {exc}") from exc
+            return removed
+
+    def reorder(self, paths: Sequence[Path]) -> list[Path]:
+        """Rinomina le slide perché l'ordine su disco sia quello di `paths`.
+
+        Gli indici diventano 1..n; il timestamp nel nome (e la data di modifica)
+        restano quelli originali. Restituisce i nuovi percorsi, nello stesso ordine.
+        """
+        with self._lock:
+            paths = [Path(p) for p in paths]
+            current = set(self._list_unlocked())
+            unknown = [p.name for p in paths if p not in current]
+            if unknown:
+                raise StorageError(f"Slide non trovate: {', '.join(unknown[:5])}")
+            targets = [
+                self.directory / f"slide_{i:04d}_{self._timestamp_of(p)}.png"
+                for i, p in enumerate(paths, start=1)
+            ]
+            ours = set(paths)
+            clashes = [t.name for t in targets if t.exists() and t not in ours]
+            if clashes:
+                raise StorageError(f"Nomi già in uso: {', '.join(clashes[:5])}")
+
+            # Due passaggi (nome temporaneo → nome finale): uno scambio di posizione
+            # tra due slide non deve mai sovrascrivere un file.
+            moved: list[tuple[Path, Path]] = []  # (originale, temporaneo)
+            try:
+                for path in paths:
+                    temp = path.with_name(path.name + _REORDER_SUFFIX)
+                    path.rename(temp)
+                    moved.append((path, temp))
+                for (_, temp), target in zip(moved, targets):
+                    temp.rename(target)
+            except OSError as exc:
+                for original, temp in moved:
+                    try:
+                        if temp.exists():
+                            temp.rename(original)
+                    except OSError:
+                        pass
+                raise StorageError(f"Riordino non riuscito: {exc}") from exc
+            return targets
+
     def clear(self) -> int:
         """Elimina tutte le slide. Restituisce il numero di file eliminati."""
         with self._lock:
@@ -93,3 +150,8 @@ class SlideStorage:
     def _index_of(path: Path) -> int:
         match = _SLIDE_PATTERN.match(path.name)
         return int(match.group(1)) if match else 0
+
+    @staticmethod
+    def _timestamp_of(path: Path) -> str:
+        match = _SLIDE_PATTERN.match(path.name)
+        return match.group(2) if match else datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python-headless>=4.10",
     "img2pdf>=0.5",
+    "pypdf>=4",
 ]
 
 [project.scripts]
