@@ -288,3 +288,20 @@ def test_gallery_drop_position_follows_reading_order(gallery) -> None:
     assert lst.drop_row_at(first.center() - QPoint(10, 0)) == 0
     assert lst.drop_row_at(first.center() + QPoint(10, 0)) == 1
     assert lst.drop_row_at(last.bottomRight() + QPoint(0, 50)) == lst.count()
+
+
+def test_gallery_import_images_appends_slides(gallery, storage: SlideStorage, tmp_path: Path) -> None:
+    good = tmp_path / "scrèenshot.png"
+    cv2.imwrite(str(tmp_path / "a.png"), np.full((40, 60, 3), 200, np.uint8))
+    (tmp_path / "a.png").rename(good)
+    bad = tmp_path / "not_an_image.png"
+    bad.write_bytes(b"nope")
+    before = gallery._list.count()
+
+    gallery._import_paths([good])
+    assert gallery._list.count() == before + 1
+    assert _paths(gallery) == storage.list_slides()
+
+    added, failed = storage.import_images([good, bad])
+    assert len(added) == 1 and failed == ["not_an_image.png"]
+    assert storage.list_slides()[-1] == added[0]

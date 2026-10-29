@@ -9,6 +9,8 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QEventLoop, QModelIndex, QPoint, QRect, QSize, Qt, QThread, Signal
 from PySide6.QtGui import (
     QColor,
+    QDrag,
+    QDragEnterEvent,
     QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
@@ -230,6 +232,7 @@ class _SlideList(QListWidget):
     delete_requested = Signal()
     toggle_requested = Signal()
     zoom_requested = Signal(int)  # +1 ingrandisci, -1 rimpicciolisci
+    files_dropped = Signal(list)  # list[Path]: file trascinati da fuori (es. Esplora risorse)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -251,6 +254,40 @@ class _SlideList(QListWidget):
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def startDrag(self, supported_actions: Qt.DropAction) -> None:  # noqa: N802
+        """Avvia il trascinamento senza lasciare alla vista la rimozione degli elementi.
+
+        Il comportamento di Qt rimuove gli elementi selezionati dalla lista se il
+        trascinamento termina con MoveAction: qui lo spostamento lo fa move_selected,
+        quindi il risultato di exec() viene ignorato.
+        """
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+        mime = self.model().mimeData(indexes)
+        if mime is None:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        rect = self.visualRect(self.currentIndex() if self.currentIndex() in indexes else indexes[0])
+        pixmap = self.viewport().grab(rect).scaledToWidth(120, Qt.TransformationMode.SmoothTransformation)
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+        drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+
+    @staticmethod
+    def _local_files(event: QDragMoveEvent | QDragEnterEvent | QDropEvent) -> list[Path]:
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return []
+        return [Path(url.toLocalFile()) for url in mime.urls() if url.isLocalFile()]
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if event.source() is not self and self._local_files(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
 
     def move_selected(self, target: int) -> bool:
         """Sposta le slide selezionate prima della riga `target`. True se l'ordine cambia."""
@@ -287,7 +324,10 @@ class _SlideList(QListWidget):
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
         if event.source() is not self:
-            event.ignore()
+            if self._local_files(event):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
             return
         super().dragMoveEvent(event)  # scorrimento automatico vicino ai bordi
         self._drop_row = self.drop_row_at(event.position().toPoint())
@@ -303,12 +343,15 @@ class _SlideList(QListWidget):
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
         self._drop_row = None
         if event.source() is not self:
-            event.ignore()
+            files = self._local_files(event)
+            if files:
+                event.acceptProposedAction()
+                self.files_dropped.emit(files)
+            else:
+                event.ignore()
             return
         self.move_selected(self.drop_row_at(event.position().toPoint()))
-        # CopyAction: impedisce alla vista di rimuovere gli elementi originali
-        # (lo spostamento è già stato fatto da move_selected).
-        event.setDropAction(Qt.DropAction.CopyAction)
+        event.setDropAction(Qt.DropAction.MoveAction)
         event.accept()
         self.stopAutoScroll()
         self.setState(QAbstractItemView.State.NoState)
@@ -403,12 +446,14 @@ class GalleryDialog(QDialog):
         self._list.delete_requested.connect(self._delete_selected)
         self._list.toggle_requested.connect(self._toggle_selected)
         self._list.zoom_requested.connect(lambda sign: self._zoom_by(sign * _ZOOM_STEP))
+        self._list.files_dropped.connect(self._import_paths)
         self._list.customContextMenuRequested.connect(self._show_context_menu)
 
         hint = QLabel(
             "Clic: seleziona · Shift/Ctrl+clic: selezione multipla · Ctrl+A: tutte · "
             "Spazio o doppio clic: includi/escludi · Canc: elimina · "
-            "trascina per riordinare · Ctrl+rotellina: zoom"
+            "trascina per riordinare · Ctrl+rotellina: zoom · "
+            "trascina file immagine qui per importarli"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(placeholder-text);")
@@ -423,6 +468,12 @@ class GalleryDialog(QDialog):
             "una voce alla volta) ed esclude tutte tranne l'ultima di ogni serie."
         )
         find_duplicates.clicked.connect(self._find_duplicates)
+        import_button = QPushButton("Importa immagini…")
+        import_button.setToolTip(
+            "Aggiunge in fondo screenshot o altre immagini (PNG, JPG, BMP, WebP…).\n"
+            "Si possono anche trascinare nella galleria dalla cartella dei file."
+        )
+        import_button.clicked.connect(self._import_dialog)
         self._delete_button = QPushButton("Elimina selezionate")
         self._delete_button.clicked.connect(self._delete_selected)
         self._summary = QLabel()
@@ -479,6 +530,7 @@ class GalleryDialog(QDialog):
         selection_row.addWidget(include_all)
         selection_row.addWidget(exclude_all)
         selection_row.addWidget(find_duplicates)
+        selection_row.addWidget(import_button)
         selection_row.addWidget(self._delete_button)
         selection_row.addSpacing(12)
         selection_row.addWidget(self._summary)
@@ -619,6 +671,40 @@ class GalleryDialog(QDialog):
         for path in self._storage.list_slides():
             self._list.addItem(self._make_item(path))
         self._update_summary()
+
+    # ----- Importazione -----
+
+    def _import_dialog(self) -> None:
+        names, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Importa immagini",
+            "",
+            "Immagini (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff);;Tutti i file (*)",
+        )
+        self._import_paths([Path(n) for n in names])
+
+    def _import_paths(self, paths: list[Path]) -> None:
+        """Copia le immagini nella cartella delle slide e le aggiunge in fondo alla lista."""
+        paths = [p for p in paths if p.is_file()]
+        if not paths:
+            return
+        try:
+            added, failed = self._storage.import_images(paths)
+        except StorageError as exc:
+            QMessageBox.critical(self, "Importazione non riuscita", str(exc))
+            self._reload()
+            return
+        for path in added:
+            self._list.addItem(self._make_item(path))
+        if added:
+            self._list.scrollToBottom()
+        self._update_summary()
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Importazione parziale",
+                "Impossibile leggere come immagine:\n" + "\n".join(failed[:10]),
+            )
 
     # ----- Duplicati -----
 

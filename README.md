@@ -65,7 +65,7 @@ L'app lo trova nel PATH o in `C:\Program Files\Tesseract-OCR`. Senza Tesseract l
 4. **Scatto manuale** (Ctrl+Shift+S) e **Annulla scatto** (Ctrl+Z).
    Dopo un annullamento la schermata attuale diventa il riferimento, così il falso positivo non viene ricatturato.
 5. **Scorciatoie globali** (solo Windows), attive anche mentre guardi la lezione:
-   **Ctrl+Alt+S** scatto manuale, **Ctrl+Alt+P** avvia/pausa.
+   **Ctrl+Shift+F9** scatto manuale, **Ctrl+Shift+F10** avvia/pausa.
    Se un'altra app le usa già, il pannello lo segnala.
 6. **Esporta PDF**: mette in pausa e apre la galleria.
    - Clic seleziona, Shift/Ctrl+clic per selezioni multiple, Ctrl+A tutte.

@@ -37,8 +37,9 @@ from .roi_selector import RoiSelector
 _SLIDER_SCALE = 10
 
 # Scorciatoie globali (attive anche mentre la finestra della lezione ha il focus).
-HOTKEY_CAPTURE = "Ctrl+Alt+S"
-HOTKEY_TOGGLE = "Ctrl+Alt+P"
+# Niente Alt: premuto da solo (o in combinazione) Zoom esce dallo schermo intero.
+HOTKEY_CAPTURE = "Ctrl+Shift+F9"
+HOTKEY_TOGGLE = "Ctrl+Shift+F10"
 
 
 class ControlPanel(QMainWindow):

@@ -62,6 +62,27 @@ class SlideStorage:
                 raise StorageError(f"Scrittura fallita: {path}: {exc}") from exc
             return path
 
+    def import_images(self, paths: Sequence[Path]) -> tuple[list[Path], list[str]]:
+        """Aggiunge in coda immagini esistenti (screenshot, foto...) come nuove slide.
+
+        Restituisce (nuovi percorsi, nomi dei file non leggibili).
+        """
+        added: list[Path] = []
+        failed: list[str] = []
+        for source in paths:
+            source = Path(source)
+            try:
+                # imdecode + pathlib: cv2.imread non gestisce percorsi non-ASCII su Windows.
+                data = np.frombuffer(source.read_bytes(), dtype=np.uint8)
+                frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            except OSError:
+                frame = None
+            if frame is None:
+                failed.append(source.name)
+                continue
+            added.append(self.save(frame))
+        return added, failed
+
     def delete_last(self) -> Path | None:
         """Elimina l'ultima slide salvata. Restituisce il file eliminato o None."""
         with self._lock:
