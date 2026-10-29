@@ -305,3 +305,38 @@ def test_gallery_import_images_appends_slides(gallery, storage: SlideStorage, tm
     added, failed = storage.import_images([good, bad])
     assert len(added) == 1 and failed == ["not_an_image.png"]
     assert storage.list_slides()[-1] == added[0]
+
+
+def test_gallery_undo_delete_reorder_and_import(gallery, storage: SlideStorage, tmp_path: Path) -> None:
+    original = [p.read_bytes() for p in storage.list_slides()]
+
+    gallery._list.item(1).setSelected(True)
+    gallery._delete_selected()
+    assert len(storage.list_slides()) == len(original) - 1
+    gallery._undo_last()
+    assert [p.read_bytes() for p in storage.list_slides()] == original
+    assert _paths(gallery) == storage.list_slides()
+
+    gallery._list.clearSelection()
+    gallery._list.item(3).setSelected(True)
+    gallery._list.move_selected(0)
+    assert [p.read_bytes() for p in storage.list_slides()] != original
+    gallery._undo_last()
+    assert [p.read_bytes() for p in storage.list_slides()] == original
+    assert _paths(gallery) == storage.list_slides()
+
+    image = tmp_path / "extra.png"
+    cv2.imwrite(str(image), np.full((40, 60, 3), 90, np.uint8))
+    gallery._import_paths([image])
+    assert len(storage.list_slides()) == len(original) + 1
+    gallery._undo_last()
+    assert [p.read_bytes() for p in storage.list_slides()] == original
+    assert not gallery._undo_button.isEnabled()
+
+
+def test_gallery_undo_keeps_exclusion_of_restored_slide(gallery, storage: SlideStorage) -> None:
+    gallery._set_included([gallery._list.item(0)], False)
+    gallery._list.item(0).setSelected(True)
+    gallery._delete_selected()
+    gallery._undo_last()
+    assert gallery._list.item(0).checkState() == Qt.CheckState.Unchecked

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import shutil
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
@@ -13,6 +15,7 @@ import numpy as np
 
 _SLIDE_PATTERN = re.compile(r"^slide_(\d{4,})_(\d{8}-\d{6})\.png$")
 _REORDER_SUFFIX = ".reorder"
+_TRASH_DIR = ".trash"
 
 
 class StorageError(Exception):
@@ -109,6 +112,45 @@ class SlideStorage:
                 except OSError as exc:
                     raise StorageError(f"Impossibile eliminare {Path(path).name}: {exc}") from exc
             return removed
+
+    def move_to_trash(self, paths: Sequence[Path]) -> list[Path]:
+        """Sposta le slide in una cartella di recupero (annullabile). Restituisce i nuovi percorsi."""
+        with self._lock:
+            trash = self.directory / _TRASH_DIR
+            moved: list[Path] = []
+            try:
+                trash.mkdir(exist_ok=True)
+                for path in paths:
+                    path = Path(path)
+                    target = trash / f"{time.monotonic_ns()}_{path.name}"
+                    path.rename(target)
+                    moved.append(target)
+            except OSError as exc:
+                for target, original in zip(moved, paths):
+                    try:
+                        target.rename(original)
+                    except OSError:
+                        pass
+                raise StorageError(f"Impossibile eliminare le slide: {exc}") from exc
+            return moved
+
+    def restore(self, trashed: Path) -> Path:
+        """Riporta una slide dal cestino in fondo all'elenco. Restituisce il nuovo percorso."""
+        with self._lock:
+            slides = self._list_unlocked()
+            next_index = self._index_of(slides[-1]) + 1 if slides else 1
+            original_name = Path(trashed).name.split("_", 1)[-1]
+            target = self.directory / f"slide_{next_index:04d}_{self._timestamp_of(Path(original_name))}.png"
+            try:
+                Path(trashed).rename(target)
+            except OSError as exc:
+                raise StorageError(f"Impossibile ripristinare {original_name}: {exc}") from exc
+            return target
+
+    def empty_trash(self) -> None:
+        trash = self.directory / _TRASH_DIR
+        if trash.is_dir():
+            shutil.rmtree(trash, ignore_errors=True)
 
     def reorder(self, paths: Sequence[Path]) -> list[Path]:
         """Rinomina le slide perché l'ordine su disco sia quello di `paths`.

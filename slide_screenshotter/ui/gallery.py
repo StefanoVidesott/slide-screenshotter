@@ -63,6 +63,9 @@ _PathRole = Qt.ItemDataRole.UserRole
 _AspectRole = Qt.ItemDataRole.UserRole + 1  # altezza / larghezza dell'immagine
 _TimeRole = Qt.ItemDataRole.UserRole + 2
 _SupersededRole = Qt.ItemDataRole.UserRole + 3  # (tipo, elemento che la supera) o None
+_TokenRole = Qt.ItemDataRole.UserRole + 4  # identità stabile, anche se il file viene rinominato
+
+_UNDO_LIMIT = 30
 
 _BADGE_COLOR = QColor("#e67e22")
 
@@ -232,6 +235,7 @@ class _SlideList(QListWidget):
     delete_requested = Signal()
     toggle_requested = Signal()
     zoom_requested = Signal(int)  # +1 ingrandisci, -1 rimpicciolisci
+    about_to_reorder = Signal()
     files_dropped = Signal(list)  # list[Path]: file trascinati da fuori (es. Esplora risorse)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -297,6 +301,7 @@ class _SlideList(QListWidget):
         contiguous = rows == list(range(rows[0], rows[-1] + 1))
         if contiguous and rows[0] <= target <= rows[-1] + 1:
             return False
+        self.about_to_reorder.emit()  # lo stato precedente va salvato per l'annullamento
         items = [self.takeItem(row) for row in reversed(rows)][::-1]
         target -= sum(1 for row in rows if row < target)
         for offset, item in enumerate(items):
@@ -431,6 +436,11 @@ class GalleryDialog(QDialog):
         self.resize(4 * 270 + 40, 720)
         settings.restore_geometry("gallery", self)
 
+        self._next_token = 0
+        self._undo: list[list[tuple[int, bool]]] = []  # snapshot: [(token, inclusa)]
+        self._trashed: dict[int, Path] = {}  # token → file nel cestino
+        storage.empty_trash()  # residui di una sessione interrotta
+
         self._thumb_width = min(max(settings.gallery_zoom, _THUMB_MIN), _THUMB_MAX)
         self._list = _SlideList()
         self._delegate = _SlideDelegate(self._list)
@@ -442,6 +452,7 @@ class GalleryDialog(QDialog):
         self._list.itemChanged.connect(self._update_summary)
         self._list.itemSelectionChanged.connect(self._update_summary)
         self._list.itemDoubleClicked.connect(self._toggle_item)
+        self._list.about_to_reorder.connect(self._push_undo)
         self._list.order_changed.connect(self._persist_order)
         self._list.delete_requested.connect(self._delete_selected)
         self._list.toggle_requested.connect(self._toggle_selected)
@@ -474,6 +485,10 @@ class GalleryDialog(QDialog):
             "Si possono anche trascinare nella galleria dalla cartella dei file."
         )
         import_button.clicked.connect(self._import_dialog)
+        self._undo_button = QPushButton("Annulla")
+        self._undo_button.setToolTip("Annulla l'ultima eliminazione, importazione o spostamento (Ctrl+Z)")
+        self._undo_button.clicked.connect(self._undo_last)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Undo), self, activated=self._undo_last)
         self._delete_button = QPushButton("Elimina selezionate")
         self._delete_button.clicked.connect(self._delete_selected)
         self._summary = QLabel()
@@ -531,6 +546,7 @@ class GalleryDialog(QDialog):
         selection_row.addWidget(exclude_all)
         selection_row.addWidget(find_duplicates)
         selection_row.addWidget(import_button)
+        selection_row.addWidget(self._undo_button)
         selection_row.addWidget(self._delete_button)
         selection_row.addSpacing(12)
         selection_row.addWidget(self._summary)
@@ -552,6 +568,7 @@ class GalleryDialog(QDialog):
         layout.addLayout(selection_row)
         layout.addLayout(export_row)
         self._update_summary()
+        self._update_undo_button()
 
     # ----- Elementi -----
 
@@ -646,20 +663,22 @@ class GalleryDialog(QDialog):
         answer = QMessageBox.question(
             self,
             "Elimina slide",
-            f"Eliminare definitivamente {len(items)} slide dal disco?",
+            f"Eliminare {len(items)} slide? Si può annullare con Ctrl+Z finché la galleria è aperta.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         paths = [item.data(_PathRole) for item in items]
+        self._push_undo()
         try:
-            self._storage.delete(paths)
+            trashed = self._storage.move_to_trash(paths)
         except StorageError as exc:
             QMessageBox.critical(self, "Eliminazione non riuscita", str(exc))
             self._reload()
             return
-        for item, path in zip(items, paths):
+        for item, path, trash_path in zip(items, paths, trashed):
+            self._trashed[self._token(item)] = trash_path
             self._delegate.forget(path)
             self._list.takeItem(self._list.row(item))
         self._update_summary()
@@ -670,7 +689,68 @@ class GalleryDialog(QDialog):
         self._list.clear()
         for path in self._storage.list_slides():
             self._list.addItem(self._make_item(path))
+        self._undo.clear()
+        self._trashed.clear()
         self._update_summary()
+        self._update_undo_button()
+
+    # ----- Annullamento -----
+
+    def _token(self, item: QListWidgetItem) -> int:
+        token = item.data(_TokenRole)
+        if token is None:
+            token = self._next_token
+            self._next_token += 1
+            item.setData(_TokenRole, token)
+        return token
+
+    def _push_undo(self) -> None:
+        """Salva ordine e inclusione attuali, da ripristinare con _undo_last."""
+        self._undo.append([(self._token(i), i.checkState() == Qt.CheckState.Checked) for i in self._all_items()])
+        del self._undo[:-_UNDO_LIMIT]
+        self._update_undo_button()
+
+    def _update_undo_button(self) -> None:
+        self._undo_button.setEnabled(bool(self._undo))
+
+    def _undo_last(self) -> None:
+        """Riporta la galleria (e i file su disco) all'ultimo stato salvato."""
+        if not self._undo:
+            return
+        snapshot = self._undo.pop()
+        wanted = {token for token, _ in snapshot}
+        current = {self._token(item): item for item in self._all_items()}
+        try:
+            # Slide create dopo lo snapshot (importate): vanno nel cestino.
+            extra = [token for token in current if token not in wanted]
+            for token, trash_path in zip(
+                extra, self._storage.move_to_trash([current[t].data(_PathRole) for t in extra])
+            ):
+                self._trashed[token] = trash_path
+            # Slide eliminate dopo lo snapshot: tornano dal cestino (in fondo, poi si riordina).
+            paths: dict[int, Path] = {t: current[t].data(_PathRole) for t in current if t in wanted}
+            for token in wanted - paths.keys():
+                paths[token] = self._storage.restore(self._trashed.pop(token))
+            order = [paths[token] for token, _ in snapshot]
+            new_paths = self._storage.reorder(order)
+        except StorageError as exc:
+            QMessageBox.critical(self, "Annullamento non riuscito", str(exc))
+            self._reload()
+            return
+        self._delegate.rename(dict(zip(order, new_paths)))
+        restored = set(wanted) - current.keys()
+        states = {token: item.checkState() for token, item in current.items()}  # clear() distrugge gli item
+        self._list.clear()
+        for (token, included), path in zip(snapshot, new_paths):
+            item = self._make_item(path)
+            item.setData(_TokenRole, token)
+            if token in restored:
+                item.setCheckState(Qt.CheckState.Checked if included else Qt.CheckState.Unchecked)
+            elif token in current:
+                item.setCheckState(states[token])  # le inclusioni attuali non si annullano
+            self._list.addItem(item)
+        self._update_summary()
+        self._update_undo_button()
 
     # ----- Importazione -----
 
@@ -688,6 +768,7 @@ class GalleryDialog(QDialog):
         paths = [p for p in paths if p.is_file()]
         if not paths:
             return
+        self._push_undo()
         try:
             added, failed = self._storage.import_images(paths)
         except StorageError as exc:
@@ -698,6 +779,9 @@ class GalleryDialog(QDialog):
             self._list.addItem(self._make_item(path))
         if added:
             self._list.scrollToBottom()
+        else:
+            self._undo.pop()
+            self._update_undo_button()
         self._update_summary()
         if failed:
             QMessageBox.warning(
@@ -817,4 +901,5 @@ class GalleryDialog(QDialog):
 
     def done(self, result: int) -> None:
         self._settings.save_geometry("gallery", self)
+        self._storage.empty_trash()
         super().done(result)
